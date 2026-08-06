@@ -1,0 +1,130 @@
+# Temporary read-only PR probe. Disposable branch only.
+name: Temporary Polymarket withdrawal PR probe
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  trace:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Identify non-core pUSD recipients
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import concurrent.futures, json, time, urllib.error, urllib.parse, urllib.request
+          from collections import defaultdict
+          from pathlib import Path
+
+          WALLETS={
+            'main':('0x565ca59275f81991bd9877d7fa8404c5ecf6519e',88300000),
+            'alt1':('0x75973c667cec880353450be3a6f17c5da67b4421',90350000),
+            'alt2':('0xa01c0a5e4f8c1114e95c68ee97694bc95e51766c',89400000),
+          }
+          PUSD='0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb'
+          CORE={
+            '0xe111180000d2663c0091e4f400237545b87b996b','0xe2222d279d744050d28e00520010520000310f59',
+            '0x4d97dcd97ec945f40cf65f87097ace5ea0476045','0x006f54f7f9a22e0000cc2ab60031000000ae9fef',
+            '0x1000008dd9001b968442c1000017eae6e0da00ba','0x200000900045e3b6259600682756002200028933',
+            '0x30000034706c7d8e12009dab006be20000c031a8','0xe3333700ca9d93003f00f0f71f8515005f6c00aa',
+            '0xa1200000d0002264c9a1698e001292d00e1b00af','0x93070a847efef7f70739046a929d47a521f5b8ee',
+            '0x2957922eb93258b93368531d39facca3b4dc5854','0xebc2459ec962869ca4c0bd1e06368272732bcb08',
+            '0xada100db00ca00073811820692005400218fce1f','0xada2005600dec949baf300f4c6120000bdb6eaab',
+            '0x0000000000000000000000000000000000000000',
+          }|{v[0] for v in WALLETS.values()}
+
+          def get(url,params=None,method='GET',body=None,attempts=5):
+            if params: url+=('&' if '?' in url else '?')+urllib.parse.urlencode(params)
+            data=json.dumps(body).encode() if body is not None else None
+            headers={'Accept':'application/json','User-Agent':'pm-pr-probe/1.0'}
+            if data is not None: headers['Content-Type']='application/json'
+            last=None
+            for n in range(attempts):
+              try:
+                req=urllib.request.Request(url,data=data,method=method,headers=headers)
+                with urllib.request.urlopen(req,timeout=35) as r:
+                  return {'ok':True,'status':r.status,'data':json.loads(r.read())}
+              except urllib.error.HTTPError as e:
+                last={'ok':False,'status':e.code,'error':str(e),'raw':e.read().decode(errors='replace')[:2000]}
+                if e.code not in (429,500,502,503,504): return last
+              except Exception as e: last={'ok':False,'error':f'{type(e).__name__}: {e}'}
+              time.sleep(.7*(n+1))
+            return last
+
+          rpc=get('https://polygon.drpc.org',method='POST',body={'jsonrpc':'2.0','id':1,'method':'eth_blockNumber','params':[]})
+          try: tip=int(rpc['data']['result'],16)
+          except Exception: tip=92000000
+
+          def window(job):
+            label,address,start,end=job
+            r=get('https://polygon.blockscout.com/api',{
+              'module':'account','action':'tokentx','address':address,'contractaddress':PUSD,
+              'startblock':start,'endblock':end,'sort':'asc','page':1,'offset':10000})
+            data=r.get('data'); rows=data.get('result',[]) if isinstance(data,dict) else []
+            return label,start,end,rows if isinstance(rows,list) else [],r
+
+          jobs=[]
+          for label,(address,start) in WALLETS.items():
+            while start<=tip:
+              jobs.append((label,address,start,min(start+29999,tip))); start+=30000
+          rows=defaultdict(list); errors=[]; caps=[]
+          with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
+            for label,start,end,part,r in (f.result() for f in concurrent.futures.as_completed([ex.submit(window,j) for j in jobs])):
+              rows[label]+=part
+              if not r.get('ok'): errors.append({'label':label,'start':start,'end':end,'response':r})
+              if len(part)>=10000: caps.append({'label':label,'start':start,'end':end})
+
+          def amt(x):
+            try:return int(x.get('value','0'))/10**int(x.get('tokenDecimal','6'))
+            except:return None
+          candidates=defaultdict(lambda:defaultdict(list)); excluded=defaultdict(lambda:defaultdict(int))
+          for label,items in rows.items():
+            wallet=WALLETS[label][0]
+            seen=set()
+            for x in items:
+              key=(x.get('hash'),x.get('transactionIndex'),x.get('from'),x.get('to'),x.get('value'))
+              if key in seen:continue
+              seen.add(key)
+              if str(x.get('from','')).lower()!=wallet: excluded[label]['incoming']+=1; continue
+              to=str(x.get('to','')).lower(); fn=str(x.get('functionName','')).lower()
+              if to in CORE: excluded[label]['core']+=1
+              elif 'matchorders' in fn or 'fillorder' in fn: excluded[label]['trade']+=1
+              else:candidates[label][to].append(x)
+
+          addresses=sorted({a for m in candidates.values() for a in m})
+          def trace(a):
+            return a,{
+              'bridge':get('https://bridge.polymarket.com/status/'+urllib.parse.quote(a,safe='')),
+              'metadata':get('https://polygon.blockscout.com/api/v2/addresses/'+a),
+            }
+          traces={}
+          with concurrent.futures.ThreadPoolExecutor(max_workers=12) as ex:
+            for a,t in (f.result() for f in concurrent.futures.as_completed([ex.submit(trace,a) for a in addresses])):traces[a]=t
+
+          out={'tip':tip,'rpc':rpc,'errors':errors,'caps':caps,'overlap':{},'wallets':{}}
+          for label,(wallet,_) in WALLETS.items():
+            cs={}
+            for a,xs in sorted(candidates[label].items()):
+              bd=traces[a]['bridge'].get('data'); bt=bd.get('transactions',[]) if isinstance(bd,dict) else []
+              cs[a]={'count':len(xs),'total_pusd':sum(amt(x) or 0 for x in xs),
+                     'transfers':[{'hash':x.get('hash'),'timestamp':x.get('timeStamp'),'amount':amt(x),'function':x.get('functionName')} for x in xs],
+                     'bridge':bt,'metadata':traces[a]['metadata'].get('data')}
+            out['wallets'][label]={'wallet':wallet,'rows':len(rows[label]),'excluded':dict(excluded[label]),'candidates':cs}
+          labels=sorted(WALLETS)
+          for i,a in enumerate(labels):
+            for b in labels[i+1:]:
+              shared=sorted(set(candidates[a])&set(candidates[b]))
+              if shared:out['overlap'][a+'|'+b]=shared
+          Path('pm-withdrawal-pr-summary.json').write_text(json.dumps(out,indent=2,sort_keys=True))
+          print('PM_PR_TRACE_START'); print(json.dumps(out,indent=2,sort_keys=True)); print('PM_PR_TRACE_END')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pm-withdrawal-pr-summary
+          path: pm-withdrawal-pr-summary.json
+          retention-days: 3
